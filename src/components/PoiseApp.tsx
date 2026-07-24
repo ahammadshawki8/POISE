@@ -89,6 +89,26 @@ interface WardrobeItem {
   colorHex: string;
   category?: string;
   occasions?: string[];
+  refImage?: string; // compressed data URL of the ACTUAL garment (captured while worn)
+  description?: string; // vision description of the real garment, for later speech
+}
+
+/** Best wardrobe match for a spoken garment phrase ("that purple punjabi"). */
+function matchWardrobe(query: string, items: WardrobeItem[]): WardrobeItem | null {
+  const q = query.toLowerCase();
+  let best: WardrobeItem | null = null;
+  let bestScore = 0;
+  for (const g of items) {
+    const name = g.name.toLowerCase();
+    let score = 0;
+    if (q.includes(name)) score += 10;
+    for (const w of name.split(/\s+/)) if (w.length >= 3 && q.includes(w)) score += 3;
+    if (score > bestScore) {
+      bestScore = score;
+      best = g;
+    }
+  }
+  return bestScore >= 3 ? best : null;
 }
 interface Weather {
   tempC: number;
@@ -807,10 +827,44 @@ export default function PoiseApp() {
 
   // --- Wardrobe memory + dynamic styling --------------------------------
 
+  // Downscale a captured frame to a small JPEG data URL for wardrobe storage.
+  const blobToThumb = useCallback(async (blob: Blob, maxDim = 512, quality = 0.6): Promise<string | null> => {
+    try {
+      const bmp = await createImageBitmap(blob);
+      const scale = Math.min(1, maxDim / Math.max(bmp.width, bmp.height));
+      const w = Math.round(bmp.width * scale);
+      const h = Math.round(bmp.height * scale);
+      const c = document.createElement("canvas");
+      c.width = w;
+      c.height = h;
+      const ctx = c.getContext("2d");
+      if (!ctx) return null;
+      ctx.drawImage(bmp, 0, 0, w, h);
+      bmp.close?.();
+      return c.toDataURL("image/jpeg", quality);
+    } catch {
+      return null;
+    }
+  }, []);
+
   const addGarment = useCallback((item: WardrobeItem): boolean => {
     const cur = wardrobeRef.current;
-    if (cur.some((g) => g.name.toLowerCase() === item.name.toLowerCase())) return false;
-    const next = [...cur, item].slice(-40);
+    const dup = cur.findIndex((g) => g.name.toLowerCase() === item.name.toLowerCase());
+    // If it exists but now has a real photo, upgrade it in place; else it's a dup.
+    let list = cur;
+    if (dup >= 0) {
+      if (!item.refImage) return false;
+      list = cur.map((g, i) => (i === dup ? { ...g, ...item } : g));
+    } else {
+      list = [...cur, item];
+    }
+    // Keep only the newest ~15 garment photos to stay well inside localStorage.
+    let next = list.slice(-40);
+    const withImg = next.filter((g) => g.refImage);
+    if (withImg.length > 15) {
+      const keep = new Set(withImg.slice(-15));
+      next = next.map((g) => (g.refImage && !keep.has(g) ? { ...g, refImage: undefined } : g));
+    }
     wardrobeRef.current = next;
     setWardrobe(next);
     pset("wardrobe", JSON.stringify(next));
@@ -824,28 +878,78 @@ export default function PoiseApp() {
   }, []);
 
   const runAddGarment = useCallback(
-    (desc: string) => {
+    async (desc: string) => {
       const p = parseGarment(desc);
       if (!p) {
         announce("I didn't catch which garment. Try, I have a black shirt.");
         return;
       }
+      const base = { name: p.name, colorHex: p.colorHex, category: p.category, occasions: p.occasions };
+
+      // Capture the ACTUAL garment they're wearing so we can try it back on later.
+      const video = videoRef.current;
+      if (video && streamRef.current) {
+        setScreen("camera");
+        announce(`Let me look at the ${p.name} you're wearing, so I can remember exactly how it looks.`);
+        setBusyLabel("Looking at what you're wearing…");
+        const blob = await captureBody(video);
+        if (blob) {
+          const thumb = await blobToThumb(blob);
+          let description: string | undefined;
+          try {
+            const fd = new FormData();
+            fd.append("image", blob, "outfit.jpg");
+            const r = await fetch("/api/poise/outfit", { method: "POST", body: fd });
+            const d = await r.json();
+            if (d.ok && d.description) description = String(d.description);
+          } catch {
+            /* vision best-effort */
+          }
+          setBusyLabel(null);
+          setScreen("style");
+          const added = addGarment({ ...base, refImage: thumb ?? undefined, description });
+          announce(
+            added
+              ? `Saved the ${p.name} you're wearing, exactly as it looks. Ask me later, how would I look in the ${p.name}, and I'll put it right back on you.`
+              : `You already have a ${p.name}.`
+          );
+          return;
+        }
+        setBusyLabel(null);
+      }
+
+      // No camera — remember it by description (turn the camera on to capture the real one).
       setScreen("style");
-      const added = addGarment({ name: p.name, colorHex: p.colorHex, category: p.category, occasions: p.occasions });
-      announce(added ? `Added the ${p.name} to your wardrobe.` : `You already have the ${p.name}.`);
+      const added = addGarment(base);
+      announce(
+        added
+          ? `Added the ${p.name} to your wardrobe. Turn on the camera and say it again if you want me to capture the exact one you're wearing.`
+          : `You already have a ${p.name}.`
+      );
     },
-    [addGarment, announce]
+    [addGarment, announce, blobToThumb, captureBody]
   );
 
   const runGarmentQuery = useCallback(
     async (desc: string) => {
       setScreen("style");
       setRenderUrl(null);
-      announce(`Let me picture you in the ${desc}. Give me a moment.`);
+      // Prefer a REAL garment saved in the wardrobe ("that purple punjabi") over
+      // a generated stand-in, so we render the exact one they own.
+      const saved = matchWardrobe(desc, wardrobeRef.current);
+      const useSaved = saved?.refImage;
+      announce(useSaved ? `Let me put your ${saved!.name} on you. Give me a moment.` : `Let me picture you in the ${desc}. Give me a moment.`);
       setBusyLabel("Generating the look…");
       try {
         const fd = new FormData();
-        fd.append("garment", desc);
+        if (useSaved) {
+          fd.append("garment", saved!.name);
+          fd.append("refImage", saved!.refImage!);
+          if (saved!.category) fd.append("refCategory", saved!.category);
+          if (saved!.description) fd.append("garmentDescription", saved!.description);
+        } else {
+          fd.append("garment", desc);
+        }
         if (colorProfileRef.current) fd.append("profile", JSON.stringify(colorProfileRef.current));
         if (weatherRef.current) fd.append("weather", JSON.stringify(weatherRef.current));
         if (skinStateRef.current.length) fd.append("skin", JSON.stringify(skinStateRef.current));
@@ -1901,15 +2005,22 @@ export default function PoiseApp() {
                 <div className="flex flex-wrap gap-2">
                   {wardrobe.map((g) => (
                     <span key={g.name} className="inline-flex items-center gap-1.5 rounded-full bg-blush/60 py-1 pl-1 pr-1 text-xs font-semibold text-plum">
-                      <span className="h-5 w-5 rounded-full ring-1 ring-black/10" style={{ background: g.colorHex }} />
-                      {g.name}
+                      {g.refImage ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img src={g.refImage} alt="" className="h-6 w-6 rounded-full object-cover ring-1 ring-black/10" />
+                      ) : (
+                        <span className="h-5 w-5 rounded-full ring-1 ring-black/10" style={{ background: g.colorHex }} />
+                      )}
+                      <button onClick={() => runGarmentQuery(g.name)} className="cursor-pointer hover:text-pinkdeep" aria-label={`See how I'd look in ${g.name}`}>
+                        {g.name}
+                      </button>
                       <button onClick={() => removeGarment(g.name)} aria-label={`Remove ${g.name}`} className="cursor-pointer rounded-full px-1.5 text-plumsoft hover:text-pinkdeep">
                         ×
                       </button>
                     </span>
                   ))}
                 </div>
-                <p className="mt-2 text-[11px] text-plumsoft/70">Say &quot;I have a black shirt&quot; to add, or &quot;I changed my clothes&quot; and I&apos;ll look.</p>
+                <p className="mt-2 text-[11px] text-plumsoft/70">Say &quot;I&apos;m wearing a white shirt, add it&quot; and I&apos;ll capture the real one. Tap a saved item to try it back on.</p>
               </Card>
             )}
 

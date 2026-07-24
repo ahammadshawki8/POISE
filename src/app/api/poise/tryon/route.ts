@@ -21,6 +21,11 @@ export async function POST(request: Request) {
     const garmentId = String(form.get("garmentId") ?? "");
     const garmentText = String(form.get("garment") ?? "");
     const occasion = String(form.get("occasion") ?? "").toLowerCase();
+    // A saved real-garment photo ("that purple punjabi") to try back on, instead
+    // of generating a stand-in. Data URL or raw base64.
+    const refImageRaw = String(form.get("refImage") ?? "");
+    const refCategory = String(form.get("refCategory") ?? "");
+    const garmentDescription = String(form.get("garmentDescription") ?? "");
 
     let profile: ColorProfile | null = null;
     try {
@@ -88,26 +93,53 @@ export async function POST(request: Request) {
     const parsed = parseGarment(garmentText);
     if (!parsed) return Response.json({ ok: false, error: "no garment recognized" }, { status: 400 });
 
-    // Build the reference garment image first (this is the "generate the image" step).
-    let ref = null as Awaited<ReturnType<typeof buildGarmentRef>>;
+    // The reference garment image: a SAVED real garment photo if we have one,
+    // else a generated stand-in recoloured to the requested hue.
+    const CLOTH: Record<string, "upper_body" | "lower_body" | "full_body"> = {
+      top: "upper_body",
+      bottom: "lower_body",
+      full_body: "full_body",
+    };
+    let refBytes: Buffer | null = null;
+    let clothCategory: "upper_body" | "lower_body" | "full_body" = "upper_body";
+    let previewFromRef: string | null = null;
     let renderNote: string | undefined;
-    try {
-      ref = await buildGarmentRef(parsed.category, parsed.colorHex);
-    } catch (e) {
-      renderNote = (e as Error).message;
-      console.warn("[poise] garment ref build failed:", renderNote);
+
+    if (refImageRaw) {
+      try {
+        const b64 = refImageRaw.includes(",") ? refImageRaw.split(",")[1] : refImageRaw;
+        refBytes = Buffer.from(b64, "base64");
+        clothCategory = CLOTH[refCategory] ?? CLOTH[parsed.category] ?? "upper_body";
+        previewFromRef = refImageRaw.startsWith("data:") ? refImageRaw : `data:image/jpeg;base64,${b64}`;
+      } catch (e) {
+        renderNote = (e as Error).message;
+      }
+    }
+    if (!refBytes) {
+      try {
+        const built = await buildGarmentRef(parsed.category, parsed.colorHex);
+        if (built) {
+          refBytes = built.refBytes;
+          clothCategory = built.clothCategory;
+          previewFromRef = built.previewDataUrl;
+        }
+      } catch (e) {
+        renderNote = (e as Error).message;
+        console.warn("[poise] garment ref build failed:", renderNote);
+      }
     }
 
     // Render it onto the body if we have both a ref and a body shot.
     let renderUrl: string | null = null;
-    if (ref && bodyBytes) {
+    if (refBytes && bodyBytes) {
       try {
-        renderUrl = await tryOnGarmentBytes(bodyBytes, ref.refBytes, ref.clothCategory, { maxWaitMs: 60_000 });
+        renderUrl = await tryOnGarmentBytes(bodyBytes, refBytes, clothCategory, { maxWaitMs: 60_000 });
       } catch (e) {
         renderNote = (e as Error).message;
         console.warn("[poise] described tryon render failed:", renderNote);
       }
     }
+    const ref = refBytes ? { previewDataUrl: previewFromRef ?? "" } : null;
 
     // Spoken verdict: palette + occasion + weather + today's skin state.
     const verdict = profile ? garmentVerdict(profile, parsed.colorHex) : null;
@@ -117,6 +149,10 @@ export async function POST(request: Request) {
       mode: "describe",
       garment: parsed.name,
       garmentColour: parsed.colorName,
+      // When it's a saved real garment, this is its actual vision description —
+      // so the speech is about the exact garment they own, not a generic one.
+      garmentDescription: garmentDescription || undefined,
+      fromWardrobe: refImageRaw ? true : undefined,
       verdict: verdict ? { rating: verdict.rating, note: verdict.note } : undefined,
       season: profile?.season,
       undertone: profile?.undertone,
